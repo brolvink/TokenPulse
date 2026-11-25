@@ -22,6 +22,8 @@ mkdir -p "$MACOS_DIR" "$RESOURCES_DIR"
 cp "$BIN_PATH" "$MACOS_DIR/TokenPulse"
 cp "$ROOT_DIR/Resources/Info.plist" "$CONTENTS_DIR/Info.plist"
 
+cp "$ROOT_DIR/Resources/TokenPulse.icns" "$RESOURCES_DIR/TokenPulse.icns"
+
 # Ad-hoc sign so macOS notifications & LaunchServices recognize bundle identity
 codesign --force --deep --sign - "$APP_DIR"
 
