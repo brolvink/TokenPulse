@@ -155,9 +155,9 @@ public final class StatusBarController: NSObject, NSPopoverDelegate {
         appearance: NSAppearance
     ) -> NSImage {
         let dark = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-        let palette = dark
-            ? [0xFFAC91, 0x67DED7, 0x9FAEFF]
-            : [0xA24230, 0x087975, 0x4E59AB]
+        let palette: [UInt32] = dark
+            ? [0xFF987C, 0xA396FF, 0x68C9FF]
+            : [0xB64428, 0x5140C3, 0x0878B4]
         let colors = palette.map { rgb in
             NSColor(srgbRed: CGFloat((rgb >> 16) & 255) / 255,
                     green: CGFloat((rgb >> 8) & 255) / 255,

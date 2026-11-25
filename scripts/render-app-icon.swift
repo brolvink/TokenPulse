@@ -38,9 +38,9 @@ context.restoreGState()
 
 let center = CGPoint(x: 512, y: 512)
 let arcColors = [
-    [color(0.77, 1, 0.96), color(0.33, 0.89, 0.76)],
-    [color(0.43, 0.94, 0.86), color(0.18, 0.62, 0.75)],
-    [color(0.29, 0.65, 0.91), color(0.49, 0.78, 0.97)],
+    [color(1, 0.62, 0.49), color(239.0 / 255, 108.0 / 255, 73.0 / 255)],
+    [color(0.65, 0.59, 1), color(102.0 / 255, 87.0 / 255, 244.0 / 255)],
+    [color(0.44, 0.81, 1), color(39.0 / 255, 159.0 / 255, 230.0 / 255)],
 ]
 
 for (index, colors) in arcColors.enumerated() {

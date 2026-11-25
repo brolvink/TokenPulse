@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 public enum AntigravityQuotaFeed {
@@ -34,6 +35,24 @@ public enum AntigravityQuotaFeed {
         let destination = file
         try FileManager.default.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
         try JSONEncoder().encode(payload).write(to: destination, options: .atomic)
+    }
+
+    @MainActor
+    static func watch(_ onChange: @escaping @MainActor () -> Void) -> (any DispatchSourceFileSystemObject)? {
+        let directory = file.deletingLastPathComponent()
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let descriptor = open(directory.path, O_EVTONLY)
+        guard descriptor != -1 else { return nil }
+        // The CLI replaces the file atomically, so observe the containing directory.
+        let source = DispatchSource.makeFileSystemObjectSource(
+            fileDescriptor: descriptor, eventMask: .write, queue: .main
+        )
+        source.setEventHandler {
+            MainActor.assumeIsolated { onChange() }
+        }
+        source.setCancelHandler { close(descriptor) }
+        source.resume()
+        return source
     }
 
     static func read(now: Date = Date()) -> (windows: [QuotaWindow], date: Date)? {

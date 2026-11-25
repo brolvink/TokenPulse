@@ -5,6 +5,11 @@ public struct AntigravityQuotaResponse: Decodable, Sendable {
         public let modelId: String?
         public let remainingFraction: Double?
         public let resetTime: String?
+
+        fileprivate var validRemaining: Double? {
+            guard let remainingFraction, (0...1).contains(remainingFraction) else { return nil }
+            return remainingFraction
+        }
     }
 
     public struct QuotaGroup: Decodable, Sendable {
@@ -49,39 +54,64 @@ public final class AntigravityProvider: QuotaProvider, @unchecked Sendable {
 
     public func fetchSnapshot(preferences: AppPreferences) async -> ProviderSnapshot {
         let localSummary = scanLocalAntigravityLogs()
+        return await fetchSnapshot(cli: Self.cliSnapshot(localTokens: localSummary), localTokens: localSummary) {
+            loadOAuthToken()?.accessToken
+        }
+    }
 
-        if let feed = AntigravityQuotaFeed.read() {
-            return ProviderSnapshot(provider: .antigravity, windows: feed.windows, localTokens: localSummary,
-                                    status: .live, sourceDetail: "Antigravity CLI", fetchedAt: feed.date,
-                                    isCached: Date().timeIntervalSince(feed.date) > 15 * 60)
+    func fetchSnapshot(
+        cli: ProviderSnapshot?,
+        localTokens: LocalTokenSummary?,
+        loadToken: () -> String?
+    ) async -> ProviderSnapshot {
+        if let cli, !cli.isCached {
+            return cli
         }
 
-        let credentials = loadOAuthToken()
-        if let creds = credentials, let token = creds.accessToken, !token.isEmpty {
+        let token = loadToken()
+        if let token, !token.isEmpty {
             if let live = try? await fetchCloudCodeQuota(token: token) {
-                let windows = Self.windows(from: live.response)
+                var windows = Self.windows(from: live.response)
                 if !windows.isEmpty {
+                    let now = Date()
+                    if let cli, !windows.contains(where: { $0.windowDurationSeconds == 7 * 86_400 }) {
+                        let weekly = cli.windows.filter {
+                            $0.windowDurationSeconds == 7 * 86_400 && ($0.resetsAt ?? .distantFuture) > now
+                        }
+                        windows += weekly.map { reading in
+                            var cached = reading
+                            cached.cachedAt = reading.cachedAt ?? cli.fetchedAt
+                            return cached
+                        }
+                    }
                     return ProviderSnapshot(
                         provider: .antigravity,
                         planName: live.tierName ?? "Google AI Plan",
                         windows: windows,
-                        localTokens: localSummary,
+                        localTokens: localTokens,
                         status: .live,
                         sourceDetail: "Cloud Code Assist Quota API"
                     )
                 }
             }
         }
-
+        if let cli { return cli }
 
         return ProviderSnapshot(
             provider: .antigravity,
             planName: nil,
             windows: [],
-            localTokens: localSummary,
+            localTokens: localTokens,
             status: .unavailable("Open Antigravity CLI and run /usage to see your live limits."),
-            sourceDetail: credentials == nil ? "CLI quota connection unavailable" : "Google quota request unavailable"
+            sourceDetail: token == nil ? "CLI quota connection unavailable" : "Google quota request unavailable"
         )
+    }
+
+    static func cliSnapshot(localTokens: LocalTokenSummary?, now: Date = Date()) -> ProviderSnapshot? {
+        guard let feed = AntigravityQuotaFeed.read(now: now) else { return nil }
+        return ProviderSnapshot(provider: .antigravity, windows: feed.windows, localTokens: localTokens,
+                                status: .live, sourceDetail: "Antigravity CLI", fetchedAt: feed.date,
+                                isCached: now.timeIntervalSince(feed.date) > 15 * 60)
     }
 
     public static func decodeQuotaResponse(from data: Data) throws -> AntigravityQuotaResponse {
@@ -93,8 +123,11 @@ public final class AntigravityProvider: QuotaProvider, @unchecked Sendable {
         if let groups = response.quotaGroups {
             for (gIdx, group) in groups.enumerated() {
                 let buckets = group.buckets ?? []
-                guard let minRemaining = buckets.compactMap(\.remainingFraction).min() else { continue }
-                let earliestReset = buckets.compactMap { Formatters.parseISO8601($0.resetTime) }.min()
+                guard let minRemaining = buckets.compactMap(\.validRemaining).min() else { continue }
+                let earliestReset = buckets
+                    .filter { $0.validRemaining == minRemaining }
+                    .compactMap { Formatters.parseISO8601($0.resetTime) }
+                    .min()
                 let label = group.displayName ?? group.id ?? "Quota Group \(gIdx + 1)"
                 result.append(QuotaWindow(
                     id: "agy-\(group.id ?? "\(gIdx)")",
@@ -102,12 +135,12 @@ public final class AntigravityProvider: QuotaProvider, @unchecked Sendable {
                     usedPercent: (1.0 - minRemaining) * 100.0,
                     resetsAt: earliestReset,
                     windowDurationSeconds: 5 * 3_600,
-                    isPrimary: gIdx == 0
+                    isPrimary: result.isEmpty
                 ))
             }
         } else if let flatBuckets = response.buckets {
             for (idx, bucket) in flatBuckets.enumerated() {
-                guard let remaining = bucket.remainingFraction else { continue }
+                guard let remaining = bucket.validRemaining else { continue }
                 let label = bucket.modelId ?? "Model \(idx + 1)"
                 result.append(QuotaWindow(
                     id: "agy-bucket-\(idx)-\(label)",
@@ -115,7 +148,7 @@ public final class AntigravityProvider: QuotaProvider, @unchecked Sendable {
                     usedPercent: (1.0 - remaining) * 100.0,
                     resetsAt: Formatters.parseISO8601(bucket.resetTime),
                     windowDurationSeconds: 5 * 3_600,
-                    isPrimary: idx == 0
+                    isPrimary: result.isEmpty
                 ))
             }
         }

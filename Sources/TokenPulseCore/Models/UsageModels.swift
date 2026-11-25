@@ -40,12 +40,18 @@ public enum AIProviderKind: String, CaseIterable, Codable, Identifiable, Sendabl
         }
     }
 
-    public var accentColor: Color {
+    public var accentRGB: UInt32 {
         switch self {
-        case .claude: return Color(red: 0.85, green: 0.47, blue: 0.34)
-        case .codex: return Color(red: 0.24, green: 0.72, blue: 0.58)
-        case .antigravity: return Color(red: 0.33, green: 0.56, blue: 0.96)
+        case .claude: return 0xEF6C49
+        case .codex: return 0x6657F4
+        case .antigravity: return 0x279FE6
         }
+    }
+
+    public var accentColor: Color {
+        Color(red: Double((accentRGB >> 16) & 255) / 255,
+              green: Double((accentRGB >> 8) & 255) / 255,
+              blue: Double(accentRGB & 255) / 255)
     }
 }
 
@@ -56,6 +62,7 @@ public struct QuotaWindow: Identifiable, Codable, Equatable, Sendable {
     public let resetsAt: Date?
     public let windowDurationSeconds: TimeInterval?
     public let isPrimary: Bool
+    public internal(set) var cachedAt: Date?
     public let isEstimated: Bool
 
     public init(
@@ -65,7 +72,8 @@ public struct QuotaWindow: Identifiable, Codable, Equatable, Sendable {
         resetsAt: Date? = nil,
         windowDurationSeconds: TimeInterval? = nil,
         isPrimary: Bool = false,
-        isEstimated: Bool = false
+        isEstimated: Bool = false,
+        cachedAt: Date? = nil
     ) {
         self.id = id
         self.label = label
@@ -73,6 +81,7 @@ public struct QuotaWindow: Identifiable, Codable, Equatable, Sendable {
         self.resetsAt = resetsAt
         self.windowDurationSeconds = windowDurationSeconds
         self.isPrimary = isPrimary
+        self.cachedAt = cachedAt
         self.isEstimated = isEstimated
     }
 

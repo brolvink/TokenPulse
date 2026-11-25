@@ -1,6 +1,4 @@
 import Foundation
-import LocalAuthentication
-import Security
 
 public struct ClaudeUsageResponse: Decodable, Sendable {
     public struct Window: Decodable, Sendable {
@@ -46,6 +44,7 @@ private struct ClaudeCredentialsFile: Decodable {
     struct OAuth: Decodable {
         let accessToken: String?
         let subscriptionType: String?
+        let expiresAt: Double?
     }
     let claudeAiOauth: OAuth?
 }
@@ -55,12 +54,13 @@ public protocol QuotaProvider: Sendable {
     func fetchSnapshot(preferences: AppPreferences) async -> ProviderSnapshot
 }
 
-public final class ClaudeProvider: QuotaProvider, @unchecked Sendable {
+public actor ClaudeProvider: QuotaProvider {
     public let kind: AIProviderKind = .claude
     private let session: URLSession
     private var rateLimitedUntil: Date?
-    private var cachedResponse: ClaudeUsageResponse?
-    private var cachedPlanName: String?
+    private var cachedSnapshot: ProviderSnapshot?
+    private var inFlight: Task<ProviderSnapshot, Never>?
+    private var cachedCredentials: ClaudeCredentials?
 
     public init(session: URLSession = .shared) {
         self.session = session
@@ -72,52 +72,73 @@ public final class ClaudeProvider: QuotaProvider, @unchecked Sendable {
 
     func fetchSnapshot(allowKeychainPrompt: Bool) async -> ProviderSnapshot {
         let localSummary = scanLocalClaudeLogs()
-
-        if let credentials = loadOAuthToken(allowKeychainPrompt: allowKeychainPrompt) {
-            if let backoff = rateLimitedUntil, Date() < backoff, let cached = cachedResponse {
-                return buildLiveSnapshot(
-                    from: cached,
-                    planName: cachedPlanName ?? credentials.planType,
-                    local: localSummary,
-                    detail: "Cached (Anthropic 429 cooldown)"
-                )
-            }
-
-            do {
-                let usage = try await fetchLiveUsage(token: credentials.token)
-                cachedResponse = usage
-                cachedPlanName = credentials.planType
-                rateLimitedUntil = nil
-                return buildLiveSnapshot(
-                    from: usage,
-                    planName: credentials.planType ?? "Claude Plan",
-                    local: localSummary,
-                    detail: "Anthropic OAuth Usage API"
-                )
-            } catch ClaudeError.rateLimited {
-                rateLimitedUntil = Date().addingTimeInterval(600)
-                if let cached = cachedResponse {
-                    return buildLiveSnapshot(
-                        from: cached,
-                        planName: cachedPlanName ?? credentials.planType,
-                        local: localSummary,
-                        detail: "Cached (rate limited)"
-                    )
-                }
-            } catch {
-                // Fall through to local fallback below.
-            }
+        guard let credentials = loadOAuthToken(allowKeychainPrompt: allowKeychainPrompt) else {
+            return ProviderSnapshot(
+                provider: .claude,
+                windows: [],
+                localTokens: localSummary,
+                status: .unavailable("No Claude Code sign-in found. Log in with Claude Code, then choose Connect Claude."),
+                sourceDetail: "No Claude OAuth credentials found"
+            )
         }
+        let snapshot = await fetchUsageSnapshot(token: credentials.token, planName: credentials.planType, local: localSummary)
+        guard snapshot.sourceDetail == Self.unauthorizedDetail else { return snapshot }
+        // Claude Code refreshed its token since we cached it. Re-read once and retry.
+        cachedCredentials = nil
+        guard let fresh = loadOAuthToken(allowKeychainPrompt: allowKeychainPrompt),
+              fresh.token != credentials.token else { return snapshot }
+        return await fetchUsageSnapshot(token: fresh.token, planName: fresh.planType, local: localSummary)
+    }
 
+    private static let unauthorizedDetail = "Anthropic OAuth token rejected"
 
-        return ProviderSnapshot(
-            provider: .claude,
-            planName: nil,
-            windows: [],
-            localTokens: localSummary,
-            status: .unavailable("Use Connect Claude in the TokenPulse menu to grant Keychain access."),
-            sourceDetail: "No Claude OAuth credentials found"
-        )
+    func fetchUsageSnapshot(token: String, planName: String?, local: LocalTokenSummary?) async -> ProviderSnapshot {
+        if let inFlight {
+            return await inFlight.value
+        }
+        if let rateLimitedUntil, Date() < rateLimitedUntil {
+            return rateLimitedSnapshot(local: local)
+        }
+        let request = Task { await requestUsageSnapshot(token: token, planName: planName, local: local) }
+        inFlight = request
+        defer { inFlight = nil }
+        return await request.value
+    }
+
+    private func requestUsageSnapshot(token: String, planName: String?, local: LocalTokenSummary?) async -> ProviderSnapshot {
+        do {
+            let usage = try await fetchLiveUsage(token: token)
+            let snapshot = ProviderSnapshot(
+                provider: .claude,
+                planName: planName ?? "Claude Plan",
+                windows: Self.windows(from: usage),
+                localTokens: local,
+                status: .live,
+                sourceDetail: "Anthropic OAuth Usage API"
+            )
+            if !snapshot.windows.isEmpty { cachedSnapshot = snapshot }
+            rateLimitedUntil = nil
+            return snapshot
+        } catch ClaudeError.unauthorized {
+            return ProviderSnapshot(
+                provider: .claude,
+                windows: [],
+                localTokens: local,
+                status: .unavailable("Claude sign-in expired. Run Claude Code once to refresh it."),
+                sourceDetail: Self.unauthorizedDetail
+            )
+        } catch ClaudeError.rateLimited(let retryAfter) {
+            rateLimitedUntil = Self.retryDate(after: retryAfter, now: Date())
+            return rateLimitedSnapshot(local: local)
+        } catch {
+            return ProviderSnapshot(
+                provider: .claude,
+                windows: [],
+                localTokens: local,
+                status: .unavailable("Claude quota is temporarily unavailable. Try refreshing again."),
+                sourceDetail: "Anthropic OAuth Usage API request failed"
+            )
+        }
     }
 
     public static func decodeUsageResponse(from data: Data) throws -> ClaudeUsageResponse {
@@ -169,24 +190,50 @@ public final class ClaudeProvider: QuotaProvider, @unchecked Sendable {
         return result
     }
 
-    private func buildLiveSnapshot(
-        from response: ClaudeUsageResponse,
-        planName: String?,
-        local: LocalTokenSummary?,
-        detail: String
-    ) -> ProviderSnapshot {
-        ProviderSnapshot(
+    private func rateLimitedSnapshot(local: LocalTokenSummary?) -> ProviderSnapshot {
+        let detail = "Anthropic Usage API rate limited"
+        let now = Date()
+        if let cachedSnapshot {
+            let windows = cachedSnapshot.windows.filter { ($0.resetsAt ?? .distantFuture) > now }
+            if !windows.isEmpty {
+                return ProviderSnapshot(
+                    provider: .claude,
+                    planName: cachedSnapshot.planName,
+                    windows: windows,
+                    localTokens: local,
+                    status: .live,
+                    sourceDetail: detail,
+                    fetchedAt: cachedSnapshot.fetchedAt,
+                    isCached: true
+                )
+            }
+        }
+        return ProviderSnapshot(
             provider: .claude,
-            planName: planName,
-            windows: Self.windows(from: response),
+            windows: [],
             localTokens: local,
-            status: .live,
+            status: .unavailable("Claude quota is temporarily rate limited."),
             sourceDetail: detail
         )
     }
 
+    private static func retryDate(after header: String?, now: Date) -> Date {
+        if let header = header?.trimmingCharacters(in: .whitespacesAndNewlines) {
+            if let seconds = Int(header), seconds >= 0 {
+                return now.addingTimeInterval(TimeInterval(seconds))
+            }
+            let formatter = DateFormatter()
+            formatter.locale = Locale(identifier: "en_US_POSIX")
+            formatter.timeZone = TimeZone(secondsFromGMT: 0)
+            formatter.dateFormat = "EEE, dd MMM yyyy HH:mm:ss zzz"
+            if let date = formatter.date(from: header) { return max(now, date) }
+        }
+        return now.addingTimeInterval(600)
+    }
+
     private enum ClaudeError: Error {
-        case rateLimited
+        case rateLimited(String?)
+        case unauthorized
         case badResponse
     }
 
@@ -206,8 +253,11 @@ public final class ClaudeProvider: QuotaProvider, @unchecked Sendable {
         guard let http = response as? HTTPURLResponse else {
             throw ClaudeError.badResponse
         }
+        if http.statusCode == 401 {
+            throw ClaudeError.unauthorized
+        }
         if http.statusCode == 429 {
-            throw ClaudeError.rateLimited
+            throw ClaudeError.rateLimited(http.value(forHTTPHeaderField: "Retry-After"))
         }
         guard (200..<300).contains(http.statusCode) else {
             throw ClaudeError.badResponse
@@ -215,49 +265,103 @@ public final class ClaudeProvider: QuotaProvider, @unchecked Sendable {
         return try Self.decodeUsageResponse(from: data)
     }
 
-    private func loadOAuthToken(allowKeychainPrompt: Bool) -> (token: String, planType: String?)? {
-        if let credsData = readKeychainCredentials(allowPrompt: allowKeychainPrompt),
-           let parsed = parseCredentialsData(credsData) {
+    struct ClaudeCredentials: Equatable {
+        let token: String
+        let planType: String?
+        let expiresAt: Date?
+    }
+
+    private func loadOAuthToken(allowKeychainPrompt: Bool) -> ClaudeCredentials? {
+        // Connect Claude is an explicit re-check, so it skips the cache.
+        if allowKeychainPrompt { cachedCredentials = nil }
+        // Reuse the token until it expires, so the keychain is read rarely.
+        if let cached = cachedCredentials,
+           (cached.expiresAt ?? .distantFuture) > Date().addingTimeInterval(60) {
+            return cached
+        }
+        cachedCredentials = nil
+        if let credsData = Self.readKeychainCredentials(),
+           let parsed = Self.parseCredentialsData(credsData) {
+            cachedCredentials = parsed
             return parsed
         }
         let fileURL = LocalFileScanner.homeDirectory
             .appendingPathComponent(".claude")
             .appendingPathComponent(".credentials.json")
         if let fileData = LocalFileScanner.readDataIfPresent(at: fileURL),
-           let parsed = parseCredentialsData(fileData) {
+           let parsed = Self.parseCredentialsData(fileData) {
+            cachedCredentials = parsed
             return parsed
         }
         return nil
     }
 
-    private func parseCredentialsData(_ data: Data) -> (token: String, planType: String?)? {
+    static func parseCredentialsData(_ data: Data) -> ClaudeCredentials? {
         if let decoded = try? JSONDecoder().decode(ClaudeCredentialsFile.self, from: data),
            let token = decoded.claudeAiOauth?.accessToken, !token.isEmpty {
-            return (token, decoded.claudeAiOauth?.subscriptionType?.capitalized)
+            let expiresAt = decoded.claudeAiOauth?.expiresAt.map { Date(timeIntervalSince1970: $0 / 1_000) }
+            return ClaudeCredentials(
+                token: token,
+                planType: decoded.claudeAiOauth?.subscriptionType?.capitalized,
+                expiresAt: expiresAt
+            )
         }
         if let raw = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
            raw.hasPrefix("sk-ant-") {
-            return (raw, nil)
+            return ClaudeCredentials(token: raw, planType: nil, expiresAt: nil)
         }
         return nil
     }
 
-    private func readKeychainCredentials(allowPrompt: Bool) -> Data? {
-        let context = LAContext()
-        context.interactionNotAllowed = !allowPrompt
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: "Claude Code-credentials",
-            kSecReturnData as String: true,
-            kSecUseAuthenticationContext as String: context,
-            kSecMatchLimit as String: kSecMatchLimitOne
-        ]
-        var result: AnyObject?
-        let status = SecItemCopyMatching(query as CFDictionary, &result)
-        guard status == errSecSuccess, let data = result as? Data else {
+    /// Claude Code writes "Claude Code-credentials" with /usr/bin/security, so that tool is
+    /// the only app its keychain ACL trusts. Reading through it never shows a password prompt.
+    /// Reading with SecItemCopyMatching from TokenPulse itself prompts, and "Always Allow"
+    /// does not last: every rebuild of the ad-hoc signed app gets a new code hash.
+    private static func readKeychainCredentials() -> Data? {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/security")
+        process.arguments = ["find-generic-password", "-s", "Claude Code-credentials", "-w"]
+        let output = Pipe()
+        process.standardOutput = output
+        process.standardError = FileHandle.nullDevice
+        process.standardInput = FileHandle.nullDevice
+        do {
+            try process.run()
+        } catch {
             return nil
         }
-        return data
+        // A locked login keychain makes `security` wait for an unlock dialog. Don't stall refreshes.
+        let watchdog = DispatchWorkItem { [process] in
+            if process.isRunning { process.terminate() }
+        }
+        DispatchQueue.global().asyncAfter(deadline: .now() + 5, execute: watchdog)
+        defer { watchdog.cancel() }
+        let data = output.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else { return nil }
+        return decodeSecurityOutput(data)
+    }
+
+    /// `security -w` prints the secret as text, or as hex when it is not plain text.
+    static func decodeSecurityOutput(_ data: Data) -> Data? {
+        guard var text = String(data: data, encoding: .utf8) else { return nil }
+        text = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return nil }
+        if text.first == "{" || text.hasPrefix("sk-ant-") {
+            return Data(text.utf8)
+        }
+        let isHex = text.count.isMultiple(of: 2) && text.allSatisfy(\.isHexDigit)
+        guard isHex else { return Data(text.utf8) }
+        var bytes = [UInt8]()
+        bytes.reserveCapacity(text.count / 2)
+        var index = text.startIndex
+        while index < text.endIndex {
+            let next = text.index(index, offsetBy: 2)
+            guard let byte = UInt8(text[index..<next], radix: 16) else { return nil }
+            bytes.append(byte)
+            index = next
+        }
+        return Data(bytes)
     }
 
     private func scanLocalClaudeLogs() -> LocalTokenSummary? {

@@ -2,6 +2,12 @@ import Combine
 import Foundation
 import SwiftUI
 
+protocol InteractiveClaudeProvider: QuotaProvider {
+    func fetchSnapshot(allowKeychainPrompt: Bool) async -> ProviderSnapshot
+}
+
+extension ClaudeProvider: InteractiveClaudeProvider {}
+
 @MainActor
 public final class UsageMonitorViewModel: ObservableObject {
     @Published public private(set) var snapshots: [ProviderSnapshot] = []
@@ -24,11 +30,15 @@ public final class UsageMonitorViewModel: ObservableObject {
         }
     }
 
+    private let forecastEngine: WeeklyQuotaForecastEngine
+    @Published private(set) var weeklyForecasts: [AIProviderKind: WeeklyQuotaForecast] = [:]
+
     private let defaults: UserDefaults
     private let providers: [any QuotaProvider]
     private let alertEngine: SurplusAlertEngine
     private var refreshTimer: Timer?
-    private var refreshRequested = false
+    private var antigravityFeedWatcher: (any DispatchSourceFileSystemObject)?
+    private var pendingRefresh: (notify: Bool, connect: Bool)?
     private var lastLiveSnapshots: [AIProviderKind: ProviderSnapshot] = [:]
     private let quotaCacheKey = "TokenPulse.QuotaCache.v1"
     private let prefsKey = "TokenPulse.Preferences.v1"
@@ -42,6 +52,7 @@ public final class UsageMonitorViewModel: ObservableObject {
         alertEngine: SurplusAlertEngine = SurplusAlertEngine(),
         defaults: UserDefaults = .standard
     ) {
+        self.forecastEngine = WeeklyQuotaForecastEngine(defaults: defaults)
         self.defaults = defaults
         self.providers = providers
         self.alertEngine = alertEngine
@@ -69,27 +80,38 @@ public final class UsageMonitorViewModel: ObservableObject {
         Task { _ = await NotificationManager.shared.requestAuthorization() }
         Task { await refreshAll(triggerNotifications: true) }
         restartTimer()
+        if antigravityFeedWatcher == nil, providers.contains(where: { $0 is AntigravityProvider }) {
+            antigravityFeedWatcher = AntigravityQuotaFeed.watch { [weak self] in
+                self?.applyAntigravityFeed()
+            }
+            applyAntigravityFeed()
+        }
     }
 
     public func stopMonitoring() {
         refreshTimer?.invalidate()
         refreshTimer = nil
+        antigravityFeedWatcher?.cancel()
+        antigravityFeedWatcher = nil
     }
 
     public func refreshAll(triggerNotifications: Bool = true, connectClaude: Bool = false) async {
         guard !isRefreshing else {
-            refreshRequested = true
+            pendingRefresh = (triggerNotifications || pendingRefresh?.notify == true,
+                              connectClaude || pendingRefresh?.connect == true)
             return
         }
         isRefreshing = true
-        defer {
-            isRefreshing = false
-            if refreshRequested {
-                refreshRequested = false
-                Task { await refreshAll(triggerNotifications: false) }
-            }
+        defer { isRefreshing = false }
+        var request: (notify: Bool, connect: Bool)? = (triggerNotifications, connectClaude)
+        while let next = request {
+            await performRefresh(triggerNotifications: next.notify, connectClaude: next.connect)
+            request = pendingRefresh
+            pendingRefresh = nil
         }
+    }
 
+    private func performRefresh(triggerNotifications: Bool, connectClaude: Bool) async {
         let currentPrefs = preferences
         if currentPrefs.demoMode {
             snapshots = Self.makeDemoSnapshots()
@@ -97,7 +119,7 @@ public final class UsageMonitorViewModel: ObservableObject {
             let results = await withTaskGroup(of: ProviderSnapshot.self) { group in
                 for provider in providers {
                     group.addTask {
-                        if connectClaude, let claude = provider as? ClaudeProvider {
+                        if connectClaude, let claude = provider as? any InteractiveClaudeProvider {
                             return await claude.fetchSnapshot(allowKeychainPrompt: true)
                         }
                         return await provider.fetchSnapshot(preferences: currentPrefs)
@@ -110,31 +132,71 @@ public final class UsageMonitorViewModel: ObservableObject {
                 return collected
             }
             guard currentPrefs.demoMode == preferences.demoMode else { return }
-            let order = AIProviderKind.allCases
             let previousCache = lastLiveSnapshots
-            snapshots = results.map(retainLastLiveSnapshot).sorted {
-                (order.firstIndex(of: $0.provider) ?? 0) < (order.firstIndex(of: $1.provider) ?? 0)
-            }
-            if lastLiveSnapshots != previousCache,
-               let data = try? JSONEncoder().encode(lastLiveSnapshots) {
-                defaults.set(data, forKey: quotaCacheKey)
-            }
+            snapshots = ordered(results.map { retainLastLiveSnapshot($0) })
+            if lastLiveSnapshots != previousCache { saveQuotaCache() }
         }
 
         lastRefreshedAt = Date()
         reevaluateAlerts(triggerNotifications: triggerNotifications)
     }
 
-    private func retainLastLiveSnapshot(_ snapshot: ProviderSnapshot) -> ProviderSnapshot {
-        if snapshot.status == .live && !snapshot.windows.isEmpty {
-            if let previous = lastLiveSnapshots[snapshot.provider], previous.fetchedAt > snapshot.fetchedAt {
-                return cachedCopy(of: previous, at: Date()) ?? snapshot
-            }
-            lastLiveSnapshots[snapshot.provider] = snapshot
-            return snapshot
+    private func applyAntigravityFeed() {
+        guard !preferences.demoMode else { return }
+        let previous = snapshots.first { $0.provider == .antigravity }
+        guard let snapshot = AntigravityProvider.cliSnapshot(localTokens: previous?.localTokens),
+              (previous?.fetchedAt ?? .distantPast) < snapshot.fetchedAt else { return }
+        snapshots = ordered(snapshots.filter { $0.provider != .antigravity } + [retainLastLiveSnapshot(snapshot)])
+        saveQuotaCache()
+        reevaluateAlerts(triggerNotifications: false)
+    }
+
+    private func ordered(_ snapshots: [ProviderSnapshot]) -> [ProviderSnapshot] {
+        AIProviderKind.allCases.compactMap { provider in snapshots.first { $0.provider == provider } }
+    }
+
+    private func saveQuotaCache() {
+        if let data = try? JSONEncoder().encode(lastLiveSnapshots) {
+            defaults.set(data, forKey: quotaCacheKey)
         }
-        guard !snapshot.isCached, let previous = lastLiveSnapshots[snapshot.provider] else { return snapshot }
-        return cachedCopy(of: previous, at: snapshot.fetchedAt, localTokens: snapshot.localTokens) ?? snapshot
+    }
+
+    private func retainLastLiveSnapshot(_ snapshot: ProviderSnapshot) -> ProviderSnapshot {
+        let previous = lastLiveSnapshots[snapshot.provider]
+        let now = Date()
+        if let previous, previous.fetchedAt > snapshot.fetchedAt,
+           let retained = cachedCopy(of: previous, at: now) {
+            // An in-flight refresh can finish after a newer CLI watcher update.
+            if let displayed = snapshots.first(where: { $0.provider == snapshot.provider }),
+               displayed.fetchedAt == previous.fetchedAt, !displayed.isCached,
+               now.timeIntervalSince(displayed.fetchedAt) < 900 {
+                return displayed
+            }
+            return retained
+        }
+        if snapshot.status == .live && !snapshot.windows.isEmpty {
+            var windows = snapshot.windows.filter { ($0.resetsAt ?? .distantFuture) > now }
+            if snapshot.provider == .antigravity, let previous {
+                // Different sources can report different periods. Keep the original
+                // observation time on a missing period until that window resets.
+                for (current, older) in [(snapshot.weeklyWindow, previous.weeklyWindow),
+                                         (snapshot.shortWindow, previous.shortWindow)] {
+                    if current == nil, var window = older, let reset = window.resetsAt, reset > now {
+                        window.cachedAt = window.cachedAt ?? previous.fetchedAt
+                        windows.append(window)
+                    }
+                }
+            }
+            if !windows.isEmpty {
+                let merged = ProviderSnapshot(provider: snapshot.provider, planName: snapshot.planName,
+                                              windows: windows, localTokens: snapshot.localTokens,
+                                              status: snapshot.status, sourceDetail: snapshot.sourceDetail,
+                                              fetchedAt: snapshot.fetchedAt, isCached: snapshot.isCached)
+                lastLiveSnapshots[snapshot.provider] = merged
+                return merged
+            }
+        }
+        return previous.flatMap { cachedCopy(of: $0, at: now, localTokens: snapshot.localTokens) } ?? snapshot
     }
 
     private func cachedCopy(
@@ -146,6 +208,20 @@ public final class UsageMonitorViewModel: ObservableObject {
                                 windows: windows, localTokens: localTokens ?? previous.localTokens,
                                 status: previous.status, sourceDetail: previous.sourceDetail,
                                 fetchedAt: previous.fetchedAt, isCached: true)
+    }
+
+    func topWeeklyForecast(at date: Date) -> WeeklyQuotaForecast? {
+        weeklyForecasts.values.filter { forecast in
+            forecast.projectedUnusedPercent >= 10 && forecast.isCurrent(at: date) &&
+                snapshots.first(where: { $0.provider == forecast.provider })?
+                .spendingWindows(at: date).contains(where: { $0.id == forecast.windowID }) == true
+        }.sorted {
+            if $0.projectedUnusedPercent != $1.projectedUnusedPercent {
+                return $0.projectedUnusedPercent > $1.projectedUnusedPercent
+            }
+            if $0.resetsAt != $1.resetsAt { return $0.resetsAt < $1.resetsAt }
+            return $0.provider.rawValue < $1.provider.rawValue
+        }.first
     }
 
     public func snoozeAlerts(hours: Double = 4) {
@@ -169,6 +245,12 @@ public final class UsageMonitorViewModel: ObservableObject {
     }
 
     private func reevaluateAlerts(triggerNotifications: Bool) {
+        if preferences.demoMode {
+            weeklyForecasts = [:]
+        } else {
+            forecastEngine.record(snapshots: snapshots)
+            weeklyForecasts = forecastEngine.forecasts(for: snapshots)
+        }
         bestRecommendation = alertEngine.bestProviderToUseNow(from: snapshots)
         activeAlerts = alertEngine.evaluateAlerts(
             snapshots: snapshots,

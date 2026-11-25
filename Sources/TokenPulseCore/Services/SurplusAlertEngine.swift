@@ -39,7 +39,7 @@ public final class SurplusAlertEngine: @unchecked Sendable {
 
         if preferences.enableSurplusAlerts {
             for snap in healthy {
-                for window in snap.windows {
+                for window in snap.spendingWindows(at: now) {
                     guard let reset = window.resetsAt, reset > now else { continue }
                     guard window.remainingPercent >= preferences.surplusThresholdPercent else { continue }
                     let leadSeconds = effectiveLeadSeconds(for: window, defaultHours: preferences.surplusLeadHours)
@@ -79,13 +79,14 @@ public final class SurplusAlertEngine: @unchecked Sendable {
 
         if preferences.enableImbalanceAlerts, healthy.count >= 2 {
             let ranked = healthy.compactMap { snap -> (ProviderSnapshot, QuotaWindow)? in
-                guard let w = usableWindows(for: snap, now: now).min(by: { $0.remainingPercent < $1.remainingPercent }) else { return nil }
+                guard let w = snap.effectiveSpendingLimit(at: now) else { return nil }
                 return (snap, w)
             }
             if let lowest = ranked.min(by: { $0.1.remainingPercent < $1.1.remainingPercent }),
                let highest = ranked.max(by: { $0.1.remainingPercent < $1.1.remainingPercent }),
                lowest.0.provider != highest.0.provider,
                lowest.1.remainingPercent <= 25,
+               highest.1.remainingPercent > 0,
                highest.1.remainingPercent >= preferences.surplusThresholdPercent {
                 candidates.append(SurplusAlert(
                     id: "shift-\(lowest.0.provider.rawValue)-to-\(highest.0.provider.rawValue)",
@@ -102,7 +103,7 @@ public final class SurplusAlertEngine: @unchecked Sendable {
 
         if preferences.enableLowQuotaAlerts {
             for snap in healthy {
-                if let w = usableWindows(for: snap, now: now).min(by: { $0.remainingPercent < $1.remainingPercent }), w.remainingPercent <= preferences.lowQuotaThresholdPercent {
+                if let w = snap.currentQuotaWindows(at: now).min(by: { $0.remainingPercent < $1.remainingPercent }), w.remainingPercent <= preferences.lowQuotaThresholdPercent {
                     candidates.append(SurplusAlert(
                         id: "low-\(snap.provider.rawValue)-\(w.id)",
                         provider: snap.provider,
@@ -142,9 +143,7 @@ public final class SurplusAlertEngine: @unchecked Sendable {
     /// Picks the single best subscription to spend tokens on right now.
     public func bestProviderToUseNow(from snapshots: [ProviderSnapshot], now: Date = Date()) -> (provider: AIProviderKind, reason: String)? {
         let candidates: [(AIProviderKind, QuotaWindow, Double)] = snapshots.compactMap { snap in
-            let windows = usableWindows(for: snap, now: now)
-            guard snap.status.isHealthy, !snap.isCached,
-                  let window = windows.min(by: { $0.remainingPercent < $1.remainingPercent }),
+            guard let window = snap.effectiveSpendingLimit(at: now),
                   window.remainingPercent > 0 else { return nil }
             // Score combines remaining capacity and urgency of approaching reset
             var urgencyBonus = 0.0
@@ -169,15 +168,74 @@ public final class SurplusAlertEngine: @unchecked Sendable {
         return (best.0, "\(best.0.displayName) has \(pct)% remaining capacity.")
     }
 
-    private func usableWindows(for snapshot: ProviderSnapshot, now: Date) -> [QuotaWindow] {
-        snapshot.windows.filter { !$0.isEstimated && ($0.resetsAt ?? .distantFuture) > now }
-    }
-
     private func effectiveLeadSeconds(for window: QuotaWindow, defaultHours: Double) -> TimeInterval {
         if let duration = window.windowDurationSeconds, duration <= 6 * 3_600 {
             // For 5h rolling sessions, alert within the last 2 hours (or 40% of window)
             return min(defaultHours * 3_600, max(1_800, duration * 0.4))
         }
         return defaultHours * 3_600
+    }
+}
+
+extension ProviderSnapshot {
+    fileprivate func currentQuotaWindows(at now: Date) -> [QuotaWindow] {
+        guard status.isHealthy, !isCached else { return [] }
+        return windows.filter {
+            !$0.isEstimated && $0.cachedAt == nil && ($0.resetsAt ?? .distantFuture) > now
+        }
+    }
+
+    func spendingWindows(at now: Date) -> [QuotaWindow] {
+        let eligibleIDs = Set(spendingPaths(at: now)
+            .filter { $0.allSatisfy { $0.remainingPercent > 0 } }
+            .flatMap { $0.map(\.id) })
+        return currentQuotaWindows(at: now).filter { eligibleIDs.contains($0.id) }
+    }
+
+    func effectiveSpendingLimit(at now: Date) -> QuotaWindow? {
+        spendingPaths(at: now)
+            .compactMap { $0.min { $0.remainingPercent < $1.remainingPercent } }
+            .max { $0.remainingPercent < $1.remainingPercent }
+    }
+
+    /// Each model pool has its own constraints and also consumes any provider-wide quota.
+    private func spendingPaths(at now: Date) -> [[QuotaWindow]] {
+        var shared: [QuotaWindow] = []
+        var pools: [String: [QuotaWindow]] = [:]
+        for window in currentQuotaWindows(at: now) {
+            if let pool = quotaPool(for: window) {
+                pools[pool, default: []].append(window)
+            } else {
+                shared.append(window)
+            }
+        }
+
+        // Claude and Codex use separate windows for additional model limits, alongside
+        // their standard quota. The shared quota remains usable by the standard pool.
+        var paths = shared.isEmpty ? [] : [shared]
+        paths += pools.keys.sorted().compactMap { pool in pools[pool].map { shared + $0 } }
+        return paths
+    }
+
+    private func quotaPool(for window: QuotaWindow) -> String? {
+        switch provider {
+        case .claude:
+            return window.id.hasPrefix("claude-7d-") ? window.id : nil
+        case .codex:
+            switch window.id {
+            case "codex-primary", "codex-secondary", "codex-rollout-primary", "codex-rollout-secondary",
+                 "codex-5h", "codex-7d":
+                return nil
+            default:
+                return window.id.hasPrefix("codex-") ? window.id : nil
+            }
+        case .antigravity:
+            guard window.id.hasPrefix("agy-cli-") else { return window.id }
+            // The CLI identifies a pool by the bucket ID with its time window removed.
+            let timeWindows: Set<Substring> = ["weekly", "5h", "session"]
+            return window.id.lowercased().dropFirst("agy-cli-".count).split(separator: "-")
+                .filter { !timeWindows.contains($0) }
+                .joined(separator: "-")
+        }
     }
 }
