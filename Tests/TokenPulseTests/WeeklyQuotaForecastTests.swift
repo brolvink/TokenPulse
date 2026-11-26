@@ -57,7 +57,7 @@ struct WeeklyQuotaForecastTests {
 
     @Test("Cached, estimated, demo, local, stale and model-only observations are excluded")
     func ignoresUntrustworthyData() throws {
-        let invalid = [
+        let invalid: [(ProviderSnapshot, TimeInterval)] = [
             (snapshot(hoursBeforeReset: 60, used: 25, cached: true), 0.0),
             (snapshot(hoursBeforeReset: 60, used: 25, cachedWindow: true), 0),
             (snapshot(hoursBeforeReset: 60, used: 25, estimated: true), 0),

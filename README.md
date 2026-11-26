@@ -10,18 +10,21 @@ A macOS menu bar app for tracking **Claude**, **Codex**, and **Gemini Antigravit
   - **Codex**: Reads `~/.codex/auth.json` to query `chatgpt.com/backend-api/wham/usage`, with automatic fallback to `~/.codex/sessions/**/*.jsonl` `rate_limits` and token usage rollouts.
   - **Gemini Antigravity**: Prefers the [CLI status-line quota feed](https://antigravity.google/docs/cli/statusline/). Falls back to the Cloud Code Assist quota request.
 - **Freshness**. Each provider shows when its quota was last read. The last successful readings are saved locally and restored on launch or after a failed refresh. Cached values are marked until the quota window resets.
+- **Weekly forecast**. After at least a day of live readings in the same cycle, the footer can estimate how much weekly quota will go unused at reset. Reading history stays on your Mac.
 - **Surplus alerts**. TokenPulse can notify you when unused quota is approaching a reset or another provider is running low.
 - **Demo Mode**: Toggle sample data in Settings to preview alerts and UI at any time.
 
 ## Install
 
-On macOS 14 or later, install the Xcode Command Line Tools and make sure Git can read the private repository without prompting. From a clone whose `origin` points to that repository, run:
+On macOS 14 or later, install the Xcode Command Line Tools. Then run these commands:
 
 ```bash
+git clone https://github.com/brolvink/TokenPulse.git
+cd TokenPulse
 ./scripts/install-app.sh
 ```
 
-The installer builds `origin/main`, installs TokenPulse in `~/Applications`, and registers a per-user updater. The updater uses your existing Git credentials.
+The installer builds `origin/main`, installs TokenPulse in `~/Applications`, and registers a per-user updater.
 
 ## Automatic updates
 
@@ -65,3 +68,7 @@ Add a `statusLine` command to the Antigravity CLI settings. Point it to the buil
 ```
 
 Quote the executable path if it contains spaces. Open a new `agy` session to start receiving updates. TokenPulse stores quota fractions and reset times in its local cache.
+
+## License
+
+[MIT License](LICENSE)

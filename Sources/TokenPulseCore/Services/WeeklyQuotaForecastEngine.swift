@@ -152,7 +152,7 @@ public final class WeeklyQuotaForecastEngine {
         let observedSpan = latest.fetchedAt.timeIntervalSince(earliest.fetchedAt)
         let timeUntilReset = reset.timeIntervalSince(latest.fetchedAt)
         // Require repeated observations over a full day and limit extrapolation to twice the observed span.
-        guard sampleCount >= 3, observedSpan >= 24 * 3_600, timeUntilReset <= 2 * observedSpan else { return nil }
+        guard sampleCount >= 3, observedSpan >= 24 * 3_600, timeUntilReset <= 2 * observedSpan + 120 else { return nil }
 
         let projectedSpend = (latest.usedPercent - earliest.usedPercent) * timeUntilReset / observedSpan
         let unused = max(0, 100 - latest.usedPercent - projectedSpend)
