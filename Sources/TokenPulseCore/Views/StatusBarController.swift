@@ -166,23 +166,24 @@ public final class StatusBarController: NSObject, NSPopoverDelegate {
         let center = NSPoint(x: 10, y: 10)
         let image = NSImage(size: NSSize(width: 20, height: 20), flipped: false) { _ in
             for (index, provider) in providers.enumerated() {
-                let start = CGFloat(137 - index * 120)
+                let sweep: CGFloat = 93
+                let start = 90 + sweep / 2 - CGFloat(index * 120)
                 let color = colors[index]
                 for (window, radius, thickness) in [
-                    (provider?.shortWindow, CGFloat(4.5), CGFloat(1.55)),
-                    (provider?.weeklyWindow, CGFloat(7.65), CGFloat(1.72))
+                    (provider?.shortWindow, CGFloat(4.35), CGFloat(1.75)),
+                    (provider?.weeklyWindow, CGFloat(7.65), CGFloat(2.55))
                 ] {
                     guard let window else {
-                        Self.strokeArc(center: center, radius: radius, start: start - 40,
-                                       sweep: 13, thickness: 1.3, color: color.withAlphaComponent(0.32))
+                        Self.strokeArc(center: center, radius: radius, start: start - sweep / 2 + 6,
+                                       sweep: 13, thickness: 1.5, color: color.withAlphaComponent(0.32))
                         continue
                     }
                     Self.strokeArc(center: center, radius: radius, start: start,
-                                   sweep: 94, thickness: 1.55, color: color.withAlphaComponent(0.27))
+                                   sweep: sweep, thickness: thickness, color: color.withAlphaComponent(0.30))
                     if showProgress, window.remainingPercent > 0 {
                         let alpha: CGFloat = window.isEstimated || provider?.isCached == true ? 0.6 : 1
                         Self.strokeArc(center: center, radius: radius, start: start,
-                                       sweep: 94 * window.remainingPercent / 100,
+                                       sweep: sweep * window.remainingPercent / 100,
                                        thickness: thickness, color: color.withAlphaComponent(alpha))
                     }
                 }
